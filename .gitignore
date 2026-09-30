@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local build artifacts (the real build lives in ~/.cache/picsheaf-build,
+# outside the repo — these are just the convenience copies
+# picsheaf_manager.sh drops next to itself after a successful build)
+*.AppImage
+*.AppImage.sha256
+Picsheaf.AppDir/
+
+# Editors
+.vscode/
+.idea/
+*.swp
