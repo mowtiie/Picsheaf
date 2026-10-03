@@ -8,5 +8,5 @@ system that doesn't have PyGObject/GTK installed yet (e.g. before
 `./web2pdf_manager.sh setup` has run).
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 APP_ID = "io.github.mowtiie.Picsheaf"
