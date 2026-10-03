@@ -107,6 +107,19 @@ class PicsheafWindow(Adw.ApplicationWindow):
         self.selection.set_mode(Gtk.SelectionMode.MULTIPLE)
         self.tree_view.set_reorderable(True)
 
+        # In SelectionMode.MULTIPLE, a plain click on an already-selected
+        # row re-selects it rather than toggling it off — clicking the
+        # sole selected row again does nothing by default, which reads as
+        # "I can't deselect this." A CAPTURE-phase click gesture lets us
+        # intercept that one case and unselect it, while leaving Ctrl/Shift
+        # click (multi-select, range-select) and clicks on unselected rows
+        # to GTK's normal handling.
+        tree_click = Gtk.GestureClick()
+        tree_click.set_button(Gdk.BUTTON_PRIMARY)
+        tree_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        tree_click.connect("pressed", self._on_tree_view_pressed)
+        self.tree_view.add_controller(tree_click)
+
         list_scroll = Gtk.ScrolledWindow()
         list_scroll.set_vexpand(True)
         list_scroll.set_child(self.tree_view)
@@ -123,6 +136,15 @@ class PicsheafWindow(Adw.ApplicationWindow):
         self.flow_box.set_margin_bottom(12)
         self.flow_box.set_margin_start(12)
         self.flow_box.set_margin_end(12)
+
+        # Same fix as the list view, applied to the grid (see the comment
+        # above tree_click): a plain click on the already-sole-selected
+        # thumbnail now deselects it instead of being a no-op.
+        grid_click = Gtk.GestureClick()
+        grid_click.set_button(Gdk.BUTTON_PRIMARY)
+        grid_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        grid_click.connect("pressed", self._on_flow_box_pressed)
+        self.flow_box.add_controller(grid_click)
 
         grid_scroll = Gtk.ScrolledWindow()
         grid_scroll.set_vexpand(True)
@@ -445,6 +467,40 @@ class PicsheafWindow(Adw.ApplicationWindow):
             return True
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # Click-to-deselect (see the comments where these controllers are
+    # attached, next to tree_click/grid_click, for why this exists)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _click_has_modifier(gesture):
+        state = gesture.get_current_event_state()
+        return bool(state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK))
+
+    def _on_tree_view_pressed(self, gesture, n_press, x, y):
+        if n_press != 1 or self._click_has_modifier(gesture):
+            return
+        hit = self.tree_view.get_path_at_pos(int(x), int(y))
+        if hit is None:
+            return
+        path = hit[0]
+        if not self.selection.path_is_selected(path):
+            return
+        _, selected_paths = self.selection.get_selected_rows()
+        if len(selected_paths) == 1 and selected_paths[0].compare(path) == 0:
+            self.selection.unselect_path(path)
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _on_flow_box_pressed(self, gesture, n_press, x, y):
+        if n_press != 1 or self._click_has_modifier(gesture):
+            return
+        child = self.flow_box.get_child_at_pos(int(x), int(y))
+        if child is None or not child.is_selected():
+            return
+        selected = self.flow_box.get_selected_children()
+        if len(selected) == 1 and selected[0] == child:
+            self.flow_box.unselect_child(child)
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
 
     # ------------------------------------------------------------------
     # Remove / reorder / clear
