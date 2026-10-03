@@ -110,13 +110,11 @@ class PicsheafWindow(Adw.ApplicationWindow):
         # In SelectionMode.MULTIPLE, a plain click on an already-selected
         # row re-selects it rather than toggling it off — clicking the
         # sole selected row again does nothing by default, which reads as
-        # "I can't deselect this." A CAPTURE-phase click gesture lets us
-        # intercept that one case and unselect it, while leaving Ctrl/Shift
-        # click (multi-select, range-select) and clicks on unselected rows
-        # to GTK's normal handling.
+        # "I can't deselect this." See the long comment above
+        # _on_tree_view_pressed for how this is fixed (observe-then-correct,
+        # not try to preempt GTK's own click handling).
         tree_click = Gtk.GestureClick()
         tree_click.set_button(Gdk.BUTTON_PRIMARY)
-        tree_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         tree_click.connect("pressed", self._on_tree_view_pressed)
         self.tree_view.add_controller(tree_click)
 
@@ -138,11 +136,11 @@ class PicsheafWindow(Adw.ApplicationWindow):
         self.flow_box.set_margin_end(12)
 
         # Same fix as the list view, applied to the grid (see the comment
-        # above tree_click): a plain click on the already-sole-selected
-        # thumbnail now deselects it instead of being a no-op.
+        # above _on_tree_view_pressed): a plain click on the
+        # already-sole-selected thumbnail now deselects it instead of
+        # being a no-op.
         grid_click = Gtk.GestureClick()
         grid_click.set_button(Gdk.BUTTON_PRIMARY)
-        grid_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         grid_click.connect("pressed", self._on_flow_box_pressed)
         self.flow_box.add_controller(grid_click)
 
@@ -471,6 +469,22 @@ class PicsheafWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------------
     # Click-to-deselect (see the comments where these controllers are
     # attached, next to tree_click/grid_click, for why this exists)
+    #
+    # This does NOT try to preempt GTK's own click-to-select handling —
+    # e.g. by claiming the press event in a CAPTURE-phase gesture — since
+    # that depends on assumptions about event-propagation/claim ordering
+    # between our controller and the widget's own built-in selection
+    # gesture that aren't guaranteed by the public API. Instead: let the
+    # click go through completely normally, and correct the result
+    # afterward. "pressed" fires synchronously alongside every other
+    # controller watching the same event, including the widget's own
+    # click-to-select logic, so by the time our handler runs we can't yet
+    # tell what GTK is about to do with it — but scheduling our check via
+    # GLib.idle_add defers it to the next main-loop iteration, by which
+    # point that synchronous dispatch (GTK's default handling included)
+    # has already finished. If the outcome is still "that one item I
+    # clicked is the sole selection," this click was a no-op under GTK's
+    # default behavior, so we toggle it off.
     # ------------------------------------------------------------------
     @staticmethod
     def _click_has_modifier(gesture):
@@ -488,8 +502,13 @@ class PicsheafWindow(Adw.ApplicationWindow):
             return
         _, selected_paths = self.selection.get_selected_rows()
         if len(selected_paths) == 1 and selected_paths[0].compare(path) == 0:
+            GLib.idle_add(self._finish_tree_toggle, path)
+
+    def _finish_tree_toggle(self, path):
+        _, selected_paths = self.selection.get_selected_rows()
+        if len(selected_paths) == 1 and selected_paths[0].compare(path) == 0:
             self.selection.unselect_path(path)
-            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        return False
 
     def _on_flow_box_pressed(self, gesture, n_press, x, y):
         if n_press != 1 or self._click_has_modifier(gesture):
@@ -499,8 +518,13 @@ class PicsheafWindow(Adw.ApplicationWindow):
             return
         selected = self.flow_box.get_selected_children()
         if len(selected) == 1 and selected[0] == child:
+            GLib.idle_add(self._finish_flow_toggle, child)
+
+    def _finish_flow_toggle(self, child):
+        selected = self.flow_box.get_selected_children()
+        if len(selected) == 1 and selected[0] == child:
             self.flow_box.unselect_child(child)
-            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        return False
 
     # ------------------------------------------------------------------
     # Remove / reorder / clear
