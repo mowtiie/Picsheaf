@@ -558,6 +558,14 @@ build_appimage() {
       <default>150</default>
       <summary>DPI used to size pages in the output PDF</summary>
     </key>
+    <key name="auto-check-updates" type="b">
+      <default>true</default>
+      <summary>Automatically check GitHub for new Picsheaf releases on launch</summary>
+    </key>
+    <key name="skip-update-version" type="s">
+      <default>''</default>
+      <summary>A release version to stop notifying about until a newer one is published</summary>
+    </key>
   </schema>
 </schemalist>
 EOF
@@ -635,7 +643,8 @@ gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw
 from picsheaf.app import PicsheafApp
 from picsheaf.image_formats import HEIF_SUPPORTED, SUPPORTED_FORMATS
-print('OK', picsheaf.__version__, 'HEIF_SUPPORTED=' + str(HEIF_SUPPORTED), 'formats=' + str(len(SUPPORTED_FORMATS)))
+from picsheaf import updater
+print('OK', picsheaf.__version__, 'HEIF_SUPPORTED=' + str(HEIF_SUPPORTED), 'formats=' + str(len(SUPPORTED_FORMATS)), 'updater=' + updater.__name__)
 " 2>&1)
     if [[ "$SANITY_CHECK" == OK* ]]; then
         echo -e "  ${GREEN}• Import sanity check passed ($SANITY_CHECK)${NC}"

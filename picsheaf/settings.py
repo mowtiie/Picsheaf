@@ -12,12 +12,14 @@ DEFAULT_JPEG_QUALITY = 90
 DEFAULT_OUTPUT_DPI = 150
 DEFAULT_WINDOW_WIDTH = 680
 DEFAULT_WINDOW_HEIGHT = 560
+DEFAULT_AUTO_CHECK_UPDATES = True
 
 _FALLBACK_DEFAULTS = {
     "window-width": DEFAULT_WINDOW_WIDTH,
     "window-height": DEFAULT_WINDOW_HEIGHT,
     "jpeg-quality": DEFAULT_JPEG_QUALITY,
     "output-dpi": DEFAULT_OUTPUT_DPI,
+    "auto-check-updates": DEFAULT_AUTO_CHECK_UPDATES,
 }
 
 
@@ -45,16 +47,44 @@ class _FallbackSettings:
         self._data[key] = value
         return True
 
+    def get_boolean(self, key):
+        return bool(self._data.get(key, False))
+
+    def set_boolean(self, key, value):
+        self._data[key] = bool(value)
+        return True
+
+
+def _backend_round_trips(backend) -> bool:
+    """Some environments (no session D-Bus bus -- certain containers,
+    minimal window managers, some remote sessions) have a GSettings
+    schema available but a dconf backend whose writes silently don't
+    take effect, even within the current process and even though
+    set_*() reports success. Probing an existing key (rather than a
+    throwaway one) once at startup means a broken backend gets routed to
+    the in-memory fallback before anything is lost, so settings still
+    behave correctly *within this session* instead of every change the
+    user makes silently going nowhere."""
+    probe_key = "window-width"
+    original = backend.get_int(probe_key)
+    probe_value = original + 1 if original < 99999 else original - 1
+    backend.set_int(probe_key, probe_value)
+    ok = backend.get_int(probe_key) == probe_value
+    backend.set_int(probe_key, original)  # restore regardless of outcome
+    return ok
+
 
 def _make_backend():
-    """Return a Gio.Settings bound to our schema if it's discoverable,
-    otherwise an in-memory fallback. Gio.Settings.new() aborts the
-    process on an unknown schema id rather than raising a catchable
-    exception, so we check via SettingsSchemaSource first."""
+    """Return a Gio.Settings bound to our schema if it's discoverable and
+    actually works, otherwise an in-memory fallback. Gio.Settings.new()
+    aborts the process on an unknown schema id rather than raising a
+    catchable exception, so we check via SettingsSchemaSource first."""
     try:
         source = Gio.SettingsSchemaSource.get_default()
         if source is not None and source.lookup(APP_ID, True) is not None:
-            return Gio.Settings.new(APP_ID)
+            backend = Gio.Settings.new(APP_ID)
+            if _backend_round_trips(backend):
+                return backend
     except Exception:
         pass
     return _FallbackSettings()
@@ -108,3 +138,19 @@ class AppSettings:
     @last_save_folder.setter
     def last_save_folder(self, value):
         self._backend.set_string("last-save-folder", value)
+
+    @property
+    def auto_check_updates(self):
+        return self._backend.get_boolean("auto-check-updates")
+
+    @auto_check_updates.setter
+    def auto_check_updates(self, value):
+        self._backend.set_boolean("auto-check-updates", bool(value))
+
+    @property
+    def skip_update_version(self):
+        return self._backend.get_string("skip-update-version")
+
+    @skip_update_version.setter
+    def skip_update_version(self, value):
+        self._backend.set_string("skip-update-version", value)

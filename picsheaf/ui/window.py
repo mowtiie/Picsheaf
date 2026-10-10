@@ -7,6 +7,8 @@ picsheaf.conversion.convert_images_to_pdf — none of which import
 each other's UI concerns.
 """
 import os
+import subprocess
+import sys
 import threading
 
 import gi
@@ -14,10 +16,12 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, Gio, Gdk, GdkPixbuf, Pango
 
+import picsheaf
 from picsheaf.settings import AppSettings
 from picsheaf.conversion import convert_images_to_pdf
 from picsheaf.thumbnails import generate_thumbnails_png_bytes
 from picsheaf.image_formats import SUPPORTED_FORMATS, is_supported
+from picsheaf import updater
 from picsheaf.ui.file_queue import FileQueueModel
 from picsheaf.ui.preferences import build_preferences_window
 
@@ -88,6 +92,37 @@ class PicsheafWindow(Adw.ApplicationWindow):
         main_box.set_margin_end(20)
         self.get_content().append(main_box)
 
+        # Update notification banner, hidden until an update check (run on
+        # every launch, see _start_update_check near the end of __init__)
+        # finds something newer. Built by hand rather than with Adw.Banner,
+        # since that widget only supports a single action button and this
+        # needs two (Update Now / Skip This Version).
+        self.update_banner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.update_banner.add_css_class("card")
+        self.update_banner.set_margin_bottom(6)
+        self.update_banner.set_margin_start(6)
+        self.update_banner.set_margin_end(6)
+        self.update_banner.set_margin_top(6)
+        self.update_banner.set_visible(False)
+
+        self.update_banner_label = Gtk.Label(label="")
+        self.update_banner_label.set_xalign(0)
+        self.update_banner_label.set_hexpand(True)
+        self.update_banner_label.set_wrap(True)
+        self.update_banner_label.set_margin_start(6)
+        self.update_banner.append(self.update_banner_label)
+
+        self.btn_update_now = Gtk.Button(label="Update Now")
+        self.btn_update_now.add_css_class("suggested-action")
+        self.btn_update_now.connect("clicked", self.on_update_now)
+        self.update_banner.append(self.btn_update_now)
+
+        self.btn_skip_update = Gtk.Button(label="Skip This Version")
+        self.btn_skip_update.connect("clicked", self.on_skip_update)
+        self.update_banner.append(self.btn_skip_update)
+
+        main_box.append(self.update_banner)
+
         # --- List view (Gtk.TreeView) ---
         self.tree_view = Gtk.TreeView(model=self.queue.store)
         self.tree_view.set_headers_visible(True)
@@ -126,7 +161,13 @@ class PicsheafWindow(Adw.ApplicationWindow):
         self.flow_box = Gtk.FlowBox()
         self.flow_box.set_valign(Gtk.Align.START)
         self.flow_box.set_max_children_per_line(8)
-        self.flow_box.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        # Selection is handled entirely ourselves (see _grid_selected_paths
+        # and _on_flow_box_pressed) rather than via FlowBox's own
+        # click-to-select — NONE disables that built-in behavior so there's
+        # no competing internal gesture to coordinate with. Programmatic
+        # select_child()/is_selected() are also no-ops under NONE, which is
+        # why the "selected" look is driven manually with state flags.
+        self.flow_box.set_selection_mode(Gtk.SelectionMode.NONE)
         self.flow_box.set_homogeneous(True)
         self.flow_box.set_row_spacing(12)
         self.flow_box.set_column_spacing(12)
@@ -242,6 +283,12 @@ class PicsheafWindow(Adw.ApplicationWindow):
             self.btn_move_down, self.btn_clear, self.btn_convert,
         ]
         self._cancel_event = threading.Event()
+        # Full paths of the currently-selected grid thumbnails -- paths
+        # rather than FlowBoxChild references, since _sync_grid_view
+        # rebuilds every child from scratch on each queue change and old
+        # widget references would go stale.
+        self._grid_selected_paths = set()
+        self._pending_update = None  # updater.UpdateInfo once a check finds one
 
         # Window-scoped actions (drive both menu items and keyboard shortcuts)
         self._add_window_action("add-files", self.on_add_files)
@@ -257,6 +304,104 @@ class PicsheafWindow(Adw.ApplicationWindow):
 
         self.btn_view_list.set_active(True)  # fires on_view_mode_toggled once
         self.refresh_list_ui()
+
+        if self.settings.auto_check_updates:
+            self._start_update_check()
+
+    # ------------------------------------------------------------------
+    # Updates
+    # ------------------------------------------------------------------
+    def _start_update_check(self):
+        def run():
+            info = updater.check_for_update(picsheaf.__version__)
+            GLib.idle_add(self._on_update_check_finished, info)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_update_check_finished(self, info):
+        if info is not None and info.version == self.settings.skip_update_version:
+            info = None
+        self._pending_update = info
+        if info is not None:
+            if updater.is_running_as_appimage():
+                self.update_banner_label.set_text(f"Picsheaf {info.version} is available.")
+            else:
+                self.update_banner_label.set_text(
+                    f"Picsheaf {info.version} is available. This build can't update itself — "
+                    "click to open the download page."
+                )
+                self.btn_update_now.set_label("View Release")
+            self.update_banner.set_visible(True)
+        return False
+
+    def on_skip_update(self, button):
+        if self._pending_update is not None:
+            self.settings.skip_update_version = self._pending_update.version
+        self.update_banner.set_visible(False)
+
+    def on_update_now(self, button):
+        info = self._pending_update
+        if info is None:
+            return
+
+        if not updater.is_running_as_appimage():
+            try:
+                Gio.AppInfo.launch_default_for_uri(info.release_notes_url, None)
+            except GLib.Error:
+                pass  # no default handler configured -- nothing more we can do here
+            return
+
+        self.btn_update_now.set_sensitive(False)
+        self.btn_skip_update.set_sensitive(False)
+        self.update_banner_label.set_text(f"Downloading Picsheaf {info.version}…")
+
+        target_path = updater.current_appimage_path()
+        target_dir = os.path.dirname(target_path)
+
+        def progress_cb(done, total):
+            if total:
+                pct = int(done / total * 100)
+                GLib.idle_add(self.update_banner_label.set_text,
+                               f"Downloading Picsheaf {info.version}… {pct}%")
+
+        def run():
+            try:
+                new_path = updater.download_and_verify(info, target_dir, progress_cb=progress_cb)
+                updater.apply_update(new_path, target_path)
+            except Exception as err:
+                GLib.idle_add(self._on_update_failed, str(err))
+                return
+            GLib.idle_add(self._on_update_applied, info)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_update_failed(self, message):
+        self.update_banner_label.set_text(f"Update failed: {message}")
+        self.btn_update_now.set_sensitive(True)
+        self.btn_update_now.set_label("Try Again")
+        self.btn_skip_update.set_sensitive(True)
+        return False
+
+    def _on_update_applied(self, info):
+        self.update_banner_label.set_text(f"Picsheaf {info.version} is ready.")
+        self.btn_update_now.set_label("Restart Now")
+        self.btn_update_now.set_sensitive(True)
+        self.btn_skip_update.set_visible(False)
+        # Swap this click handler for a plain relaunch -- the download/
+        # verify/apply flow is done, there's nothing left to retry.
+        self.btn_update_now.disconnect_by_func(self.on_update_now)
+        self.btn_update_now.connect("clicked", self._on_restart_clicked)
+        return False
+
+    def _on_restart_clicked(self, button):
+        appimage_path = updater.current_appimage_path()
+        if appimage_path:
+            subprocess.Popen([appimage_path], start_new_session=True)
+        app = self.get_application()
+        if app is not None:
+            app.quit()
+        else:
+            sys.exit(0)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -335,11 +480,13 @@ class PicsheafWindow(Adw.ApplicationWindow):
             self.flow_box.remove(child)
             child = next_child
 
+        current_paths = set()
         it = self.queue.store.get_iter_first()
         while it is not None:
             large_pixbuf = self.queue.store.get_value(it, FileQueueModel.COL_THUMB_LARGE)
             name = self.queue.store.get_value(it, FileQueueModel.COL_NAME)
             path = self.queue.store.get_value(it, FileQueueModel.COL_PATH)
+            current_paths.add(path)
 
             cell_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             picture = Gtk.Picture()
@@ -357,9 +504,18 @@ class PicsheafWindow(Adw.ApplicationWindow):
             flow_child = Gtk.FlowBoxChild()
             flow_child.set_child(cell_box)
             flow_child.queue_path = path
+            # Rebuilding destroys the old FlowBoxChild (and its state
+            # flags along with it), so re-apply the "selected" look for
+            # anything our own tracking still considers selected.
+            if path in self._grid_selected_paths:
+                flow_child.set_state_flags(Gtk.StateFlags.SELECTED, False)
             self.flow_box.append(flow_child)
 
             it = self.queue.store.iter_next(it)
+
+        # Drop tracking for any path that's no longer queued (e.g. removed
+        # or cleared) so it can't resurface as a phantom selection later.
+        self._grid_selected_paths &= current_paths
         return False
 
     # ------------------------------------------------------------------
@@ -468,23 +624,26 @@ class PicsheafWindow(Adw.ApplicationWindow):
 
     # ------------------------------------------------------------------
     # Click-to-deselect (see the comments where these controllers are
-    # attached, next to tree_click/grid_click, for why this exists)
+    # attached, next to tree_click/grid_click, for why this exists: in
+    # SelectionMode.MULTIPLE, GTK's default behavior treats a plain click
+    # on the already-sole-selected item as a no-op rather than toggling
+    # it off, which reads as "I can't deselect this.")
     #
-    # This does NOT try to preempt GTK's own click-to-select handling —
-    # e.g. by claiming the press event in a CAPTURE-phase gesture — since
-    # that depends on assumptions about event-propagation/claim ordering
-    # between our controller and the widget's own built-in selection
-    # gesture that aren't guaranteed by the public API. Instead: let the
-    # click go through completely normally, and correct the result
-    # afterward. "pressed" fires synchronously alongside every other
-    # controller watching the same event, including the widget's own
-    # click-to-select logic, so by the time our handler runs we can't yet
-    # tell what GTK is about to do with it — but scheduling our check via
-    # GLib.idle_add defers it to the next main-loop iteration, by which
-    # point that synchronous dispatch (GTK's default handling included)
-    # has already finished. If the outcome is still "that one item I
-    # clicked is the sole selection," this click was a no-op under GTK's
-    # default behavior, so we toggle it off.
+    # The list view below takes the conservative approach: let GTK's own
+    # click-to-select run normally, then correct the result afterward via
+    # GLib.idle_add once that synchronous dispatch has finished.
+    #
+    # The grid view does NOT use this approach — two attempts at it did
+    # not fix the bug in practice (confirmed by the person using the app,
+    # not just by logic-level testing here), most likely because
+    # Gtk.FlowBox's internal click-to-select gesture claims the press
+    # sequence in a way that can prevent an externally-added, differently
+    # grouped gesture from ever being notified at all, regardless of
+    # propagation phase. Rather than keep guessing at FlowBox's internal
+    # implementation, grid selection is handled with fully custom
+    # tracking instead (_grid_selected_paths) with FlowBox's own
+    # selection mechanism disabled entirely (SelectionMode.NONE) — so
+    # there is no competing internal gesture left to coordinate with.
     # ------------------------------------------------------------------
     @staticmethod
     def _click_has_modifier(gesture):
@@ -511,20 +670,44 @@ class PicsheafWindow(Adw.ApplicationWindow):
         return False
 
     def _on_flow_box_pressed(self, gesture, n_press, x, y):
-        if n_press != 1 or self._click_has_modifier(gesture):
+        if n_press != 1:
             return
         child = self.flow_box.get_child_at_pos(int(x), int(y))
-        if child is None or not child.is_selected():
+        if child is None:
             return
-        selected = self.flow_box.get_selected_children()
-        if len(selected) == 1 and selected[0] == child:
-            GLib.idle_add(self._finish_flow_toggle, child)
+        path = child.queue_path
 
-    def _finish_flow_toggle(self, child):
-        selected = self.flow_box.get_selected_children()
-        if len(selected) == 1 and selected[0] == child:
-            self.flow_box.unselect_child(child)
-        return False
+        if self._click_has_modifier(gesture):
+            # Ctrl/Shift-click: toggle just this one, leave the rest alone.
+            if path in self._grid_selected_paths:
+                self._grid_selected_paths.discard(path)
+                child.unset_state_flags(Gtk.StateFlags.SELECTED)
+            else:
+                self._grid_selected_paths.add(path)
+                child.set_state_flags(Gtk.StateFlags.SELECTED, False)
+            return
+
+        if self._grid_selected_paths == {path}:
+            # The one case GTK's default click-to-select would treat as a
+            # no-op: clicking the only selected thumbnail again.
+            self._grid_selected_paths.discard(path)
+            child.unset_state_flags(Gtk.StateFlags.SELECTED)
+            return
+
+        # Plain click on anything else: select only this one.
+        self._clear_grid_selection_flags()
+        self._grid_selected_paths = {path}
+        child.set_state_flags(Gtk.StateFlags.SELECTED, False)
+
+    def _clear_grid_selection_flags(self):
+        """Remove the visual SELECTED flag from every currently-flagged
+        child. Callers are responsible for updating _grid_selected_paths
+        itself to match afterward."""
+        c = self.flow_box.get_first_child()
+        while c is not None:
+            if getattr(c, "queue_path", None) in self._grid_selected_paths:
+                c.unset_state_flags(Gtk.StateFlags.SELECTED)
+            c = c.get_next_sibling()
 
     # ------------------------------------------------------------------
     # Remove / reorder / clear
@@ -533,8 +716,8 @@ class PicsheafWindow(Adw.ApplicationWindow):
         """Selected rows as Gtk.TreePath, from whichever view is active."""
         if self._view_mode == "grid":
             paths = []
-            for child in self.flow_box.get_selected_children():
-                tp = self.queue.tree_path_for(child.queue_path)
+            for file_path in self._grid_selected_paths:
+                tp = self.queue.tree_path_for(file_path)
                 if tp is not None:
                     paths.append(tp)
             return paths
